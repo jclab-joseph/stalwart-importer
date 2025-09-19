@@ -1,4 +1,4 @@
-package main
+package mailbox
 
 import (
 	"fmt"
@@ -7,6 +7,22 @@ import (
 	"path/filepath"
 	"strings"
 )
+
+// MailboxFormat represents the format of the mailbox
+type MailboxFormat string
+
+const (
+	MailboxFormatMaildir       MailboxFormat = "maildir"
+	MailboxFormatMaildirNested MailboxFormat = "maildir-nested"
+)
+
+// Message represents an email message
+type Message struct {
+	Identifier   string
+	Flags        []string
+	InternalDate int64
+	Contents     []byte
+}
 
 // Mailbox represents a mailbox iterator
 type Mailbox struct {
