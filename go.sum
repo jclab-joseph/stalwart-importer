@@ -1,0 +1,5 @@
+github.com/foxcpp/go-jmap v0.0.0-20190910172102-6e1038ead392 h1:m2rzuhEefUjUK5807TfBZfhQeD28WBvGovWNyFEpjas=
+github.com/foxcpp/go-jmap v0.0.0-20190910172102-6e1038ead392/go.mod h1:GnluSBPjlyy7IV/w97c5wIYlUn4zBT7/3z3dBIgxIWg=
+github.com/google/go-cmp v0.3.0/go.mod h1:8QqcDgzrUqlUb/G2PQTWiueGozuR1884gddMywk6iLU=
+github.com/pkg/errors v0.8.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=
+gotest.tools v2.2.0+incompatible/go.mod h1:DsYFclhRJ6vuDpmuTbkuFWG+y2sxOXAzmJt81HFBacw=
