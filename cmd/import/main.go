@@ -15,17 +15,6 @@ import (
 	"github.com/jclab-joseph/stalwart-importer/pkg/mailbox"
 )
 
-// Use types from pkg/mailbox
-type MailboxFormat = mailbox.MailboxFormat
-type Message = mailbox.Message
-
-const (
-	MailboxFormatMaildir       = mailbox.MailboxFormatMaildir
-	MailboxFormatMaildirNested = mailbox.MailboxFormatMaildirNested
-)
-
-// headerTransport is now handled by pkg/jmap.Client
-
 // JMAPClient represents a JMAP client using our pkg/jmap library
 type JMAPClient struct {
 	client     *jmapclient.Client
@@ -83,10 +72,10 @@ type ImportCommands struct {
 
 // ImportMessages represents the messages import command
 type ImportMessages struct {
-	NumConcurrent *int          `json:"num_concurrent,omitempty"`
-	Format        MailboxFormat `json:"format"`
-	Account       string        `json:"account"`
-	Path          string        `json:"path"`
+	NumConcurrent *int                  `json:"num_concurrent,omitempty"`
+	Format        mailbox.MailboxFormat `json:"format"`
+	Account       string                `json:"account"`
+	Path          string                `json:"path"`
 }
 
 // ImportAccount represents the account import command
@@ -113,7 +102,7 @@ func (cmd *ImportMessages) Execute(client *JMAPClient) error {
 
 	fmt.Println("[1/4] Parsing mailbox...")
 
-	mailbox, err := mailbox.NewMailbox(cmd.Format, cmd.Path)
+	box, err := mailbox.NewMailbox(cmd.Format, cmd.Path)
 	if err != nil {
 		return fmt.Errorf("failed to open mailbox: %w", err)
 	}
@@ -139,7 +128,7 @@ func (cmd *ImportMessages) Execute(client *JMAPClient) error {
 	sem := make(chan struct{}, numConcurrent)
 
 	for {
-		msg, err := mailbox.Next()
+		msg, err := box.Next()
 		if err == io.EOF {
 			break
 		}
@@ -149,7 +138,7 @@ func (cmd *ImportMessages) Execute(client *JMAPClient) error {
 		}
 
 		wg.Add(1)
-		go func(msg *Message) {
+		go func(msg *mailbox.Message) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
@@ -268,7 +257,7 @@ func main() {
 			log.Fatal("Usage: stalwart-cli import messages <num_concurrent> <format> <account> <path>")
 		}
 		numConcurrent, _ := strconv.Atoi(args[1])
-		format := MailboxFormat(args[2])
+		format := mailbox.MailboxFormat(args[2])
 		account := args[3]
 		path := args[4]
 		cmd.Messages = &ImportMessages{
