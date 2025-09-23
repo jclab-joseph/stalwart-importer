@@ -6,7 +6,6 @@ import (
 	"io"
 	"log"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -164,7 +163,7 @@ func (cmd *ImportMessages) Execute(client *JMAPClient) error {
 
 	fmt.Println("[1/4] Parsing mailbox...")
 
-	box, err := mailbox.NewMailbox(cmd.Format, cmd.Path)
+	boxes, err := mailbox.NewMailbox(cmd.Format, cmd.Path)
 	if err != nil {
 		return fmt.Errorf("failed to open mailbox: %w", err)
 	}
@@ -177,10 +176,11 @@ func (cmd *ImportMessages) Execute(client *JMAPClient) error {
 
 	fmt.Println("[3/4] Checking mailboxes...")
 
-	for _, source := range box.Folders {
-		target := cmd.mapMailbox(source, serverMailboxes)
+	// Check all mailboxes found
+	for _, box := range boxes {
+		target := cmd.mapMailbox(box.Folder, serverMailboxes)
 		if target == "" {
-			log.Fatalf("Mailbox '%s' not found on server\n", source)
+			log.Fatalf("Mailbox '%s' not found on server\n", box.Folder)
 		}
 	}
 
@@ -192,71 +192,79 @@ func (cmd *ImportMessages) Execute(client *JMAPClient) error {
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, numConcurrent)
 
-	for {
-		msg, err := box.Next()
-		if err == io.EOF {
-			break
+	// Process each mailbox
+	for _, box := range boxes {
+		for {
+			msg, err := box.Next()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				failures = append(failures, fmt.Sprintf("I/O error reading message: %v", err))
+				continue
+			}
+
+			wg.Add(1)
+			go func(msg *mailbox.Message) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+
+				// Convert flags to JMAP keywords
+				keywords := make(map[string]bool)
+				for _, flag := range msg.Flags {
+					switch flag {
+					case "seen":
+						keywords["$seen"] = true
+					case "answered":
+						keywords["$answered"] = true
+					case "flagged":
+						keywords["$flagged"] = true
+					case "deleted":
+						keywords["$deleted"] = true
+					case "draft":
+						keywords["$draft"] = true
+					}
+				}
+
+				// Merge JMAP keywords from dovecot keywords (already converted in mailbox package)
+				for k, v := range msg.Keywords {
+					keywords[k] = v
+				}
+
+				// Use mailbox name from the message (for nested maildir support)
+				sourceMailboxName := msg.MailboxName
+				// Map to server mailbox name
+				mailboxName := cmd.mapMailbox(sourceMailboxName, serverMailboxes)
+
+				var receivedAt *int64
+				if msg.InternalDate > 0 {
+					receivedAt = &msg.InternalDate
+				}
+
+				// Retry logic
+				maxRetries := 3
+				for retry := 0; retry < maxRetries; retry++ {
+					err := client.ImportEmail(msg.Contents, mailboxName, keywords, receivedAt)
+					if err == nil {
+						atomic.AddInt64(&totalImported, 1)
+						fmt.Printf("Successfully imported message: %s\n", msg.Identifier)
+						return
+					}
+
+					fmt.Printf("Failed to import message %s (attempt %d/%d): %v\n", msg.Identifier, retry+1, maxRetries, err)
+
+					if retry < maxRetries-1 {
+						// Exponential backoff
+						time.Sleep(time.Duration(100*(1<<retry)) * time.Millisecond)
+						continue
+					}
+
+					// Failed after all retries
+					failures = append(failures, fmt.Sprintf("Failed to import message %s after %d attempts: %v", msg.Identifier, maxRetries, err))
+				}
+			}(msg)
 		}
-		if err != nil {
-			failures = append(failures, fmt.Sprintf("I/O error reading message: %v", err))
-			continue
-		}
-
-		wg.Add(1)
-		go func(msg *mailbox.Message) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			// Convert flags to JMAP keywords
-			keywords := make(map[string]bool)
-			for _, flag := range msg.Flags {
-				switch flag {
-				case "seen":
-					keywords["$seen"] = true
-				case "answered":
-					keywords["$answered"] = true
-				case "flagged":
-					keywords["$flagged"] = true
-				case "deleted":
-					keywords["$deleted"] = true
-				case "draft":
-					keywords["$draft"] = true
-				}
-			}
-
-			// Use mailbox name from the message (for nested maildir support)
-			sourceMailboxName := msg.MailboxName
-			// Map to server mailbox name
-			mailboxName := cmd.mapMailbox(sourceMailboxName, serverMailboxes)
-
-			var receivedAt *int64
-			if msg.InternalDate > 0 {
-				receivedAt = &msg.InternalDate
-			}
-
-			// Retry logic
-			maxRetries := 3
-			for retry := 0; retry < maxRetries; retry++ {
-				err := client.ImportEmail(msg.Contents, mailboxName, keywords, receivedAt)
-				if err == nil {
-					atomic.AddInt64(&totalImported, 1)
-					fmt.Printf("Successfully imported message: %s\n", msg.Identifier)
-					return
-				}
-
-				fmt.Printf("Failed to import message %s (attempt %d/%d): %v\n", msg.Identifier, retry+1, maxRetries, err)
-
-				if retry < maxRetries-1 {
-					// Exponential backoff
-					time.Sleep(time.Duration(100*(1<<retry)) * time.Millisecond)
-					continue
-				}
-
-				// Failed after all retries
-				failures = append(failures, fmt.Sprintf("Failed to import message %s after %d attempts: %v", msg.Identifier, maxRetries, err))
-			}
-		}(msg)
 	}
 
 	wg.Wait()
@@ -277,12 +285,13 @@ func main() {
 	// Global flags
 	var mailboxMapStrs StringArray
 	var (
-		url         = flag.String("u", "", "Server base URL")
-		urlLong     = flag.String("url", "", "Server base URL")
-		credentials = flag.String("c", "", "Authentication credentials (user:password)")
-		credLong    = flag.String("credentials", "", "Authentication credentials (user:password)")
-		timeout     = flag.Int("t", 30, "Connection timeout in seconds")
-		timeoutLong = flag.Int("timeout", 30, "Connection timeout in seconds")
+		url           = flag.String("u", "", "Server base URL")
+		urlLong       = flag.String("url", "", "Server base URL")
+		credentials   = flag.String("c", "", "Authentication credentials (user:password)")
+		credLong      = flag.String("credentials", "", "Authentication credentials (user:password)")
+		timeout       = flag.Int("t", 30, "Connection timeout in seconds")
+		timeoutLong   = flag.Int("timeout", 30, "Connection timeout in seconds")
+		numConcurrent = flag.Int("concurrent", 4, "Number of concurrent requests")
 	)
 	flag.Var(&mailboxMapStrs, "mailbox-map", "Mailbox mapping in format OLD=NEW")
 
@@ -309,25 +318,24 @@ func main() {
 	}
 
 	args := flag.Args()
-	if len(args) < 2 {
-		log.Fatal("Usage: stalwart-cli import <command> [options]")
+	if len(args) < 1 {
+		log.Fatal("Usage: stalwart-import <command> [options]")
 	}
 
 	// Skip "import" command
-	command := args[1]
+	command := args[0]
 	args = args[1:]
 
 	var cmd ImportCommands
 
 	switch command {
 	case "messages":
-		if len(args) < 5 {
-			log.Fatal("Usage: stalwart-cli import messages <num_concurrent> <format> <account> <path>")
+		if len(args) < 3 {
+			log.Fatal("Usage: stalwart-import messages <format> <account> <path>")
 		}
-		numConcurrent, _ := strconv.Atoi(args[1])
-		format := mailbox.Format(args[2])
-		account := args[3]
-		path := args[4]
+		format := mailbox.Format(args[0])
+		account := args[1]
+		path := args[2]
 		// Parse mailbox mapping
 		mailboxMap := make(map[string]string, len(mailboxMapStrs))
 		for _, str := range mailboxMapStrs {
@@ -340,23 +348,11 @@ func main() {
 		}
 
 		cmd.Messages = &ImportMessages{
-			NumConcurrent: &numConcurrent,
+			NumConcurrent: numConcurrent,
 			Format:        format,
 			Account:       account,
 			Path:          path,
 			MailboxMap:    mailboxMap,
-		}
-	case "account":
-		if len(args) < 4 {
-			log.Fatal("Usage: stalwart-cli import account <num_concurrent> <account> <path>")
-		}
-		numConcurrent, _ := strconv.Atoi(args[1])
-		account := args[2]
-		path := args[3]
-		cmd.Account = &ImportAccount{
-			NumConcurrent: &numConcurrent,
-			Account:       account,
-			Path:          path,
 		}
 	default:
 		log.Fatalf("Unknown command: %s", command)
