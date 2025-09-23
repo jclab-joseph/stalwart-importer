@@ -14,6 +14,113 @@ import (
 	"github.com/foxcpp/go-jmap/client"
 )
 
+// PrincipalQueryRequest represents a Principal/query request
+type PrincipalQueryRequest struct {
+	Using       []string                   `json:"using"`
+	MethodCalls []PrincipalQueryMethodCall `json:"methodCalls"`
+}
+
+// PrincipalQueryMethodCall represents a method call in Principal/query
+type PrincipalQueryMethodCall struct {
+	Name string             `json:"name"`
+	Args PrincipalQueryArgs `json:"args"`
+	ID   string             `json:"id"`
+}
+
+// PrincipalQueryArgs represents arguments for Principal/query
+type PrincipalQueryArgs struct {
+	AccountID string                 `json:"accountId"`
+	Filter    map[string]interface{} `json:"filter"`
+}
+
+// PrincipalQueryResponse represents a Principal/query response
+type PrincipalQueryResponse struct {
+	MethodResponses []PrincipalQueryMethodResponse `json:"methodResponses"`
+}
+
+// PrincipalQueryMethodResponse represents a method response in Principal/query
+type PrincipalQueryMethodResponse struct {
+	Name string               `json:"name"`
+	Args PrincipalQueryResult `json:"args"`
+	ID   string               `json:"id"`
+}
+
+// PrincipalQueryResult represents the result of Principal/query
+type PrincipalQueryResult struct {
+	IDs []string `json:"ids"`
+}
+
+// MailboxGetRequest represents a Mailbox/get request
+type MailboxGetRequest struct {
+	Using       []string               `json:"using"`
+	MethodCalls []MailboxGetMethodCall `json:"methodCalls"`
+}
+
+// MailboxGetMethodCall represents a method call in Mailbox/get
+type MailboxGetMethodCall struct {
+	Name string         `json:"name"`
+	Args MailboxGetArgs `json:"args"`
+	ID   string         `json:"id"`
+}
+
+// MailboxGetArgs represents arguments for Mailbox/get
+type MailboxGetArgs struct {
+	AccountID  string   `json:"accountId"`
+	Properties []string `json:"properties"`
+}
+
+// MailboxGetResponse represents a Mailbox/get response
+type MailboxGetResponse struct {
+	MethodResponses []MailboxGetMethodResponse `json:"methodResponses"`
+}
+
+// MailboxGetMethodResponse represents a method response in Mailbox/get
+type MailboxGetMethodResponse struct {
+	Name string           `json:"name"`
+	Args MailboxGetResult `json:"args"`
+	ID   string           `json:"id"`
+}
+
+// MailboxGetResult represents the result of Mailbox/get
+type MailboxGetResult struct {
+	List []MailboxInfo `json:"list"`
+}
+
+// MailboxInfo represents mailbox information
+type MailboxInfo struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	ParentID string `json:"parentId,omitempty"`
+	Role     string `json:"role,omitempty"`
+}
+
+// EmailImportRequest represents an Email/import request
+type EmailImportRequest struct {
+	Using       []string                `json:"using"`
+	MethodCalls []EmailImportMethodCall `json:"methodCalls"`
+}
+
+// EmailImportMethodCall represents a method call in Email/import
+type EmailImportMethodCall struct {
+	Name string          `json:"name"`
+	Args EmailImportArgs `json:"args"`
+	ID   string          `json:"id"`
+}
+
+// EmailImportArgs represents arguments for Email/import
+type EmailImportArgs struct {
+	AccountID string                 `json:"accountId"`
+	Emails    map[string]EmailImport `json:"emails"`
+}
+
+// EmailImport represents an email to import
+type EmailImport struct {
+	BlobID     string          `json:"blobId"`
+	MailboxIDs map[string]bool `json:"mailboxIds"`
+	Keywords   map[string]bool `json:"keywords"`
+	ReceivedAt string          `json:"receivedAt,omitempty"`
+}
+
 // headerTransport is a custom HTTP transport that replaces Authentication header with Authorization
 type headerTransport struct {
 	baseTransport http.RoundTripper
