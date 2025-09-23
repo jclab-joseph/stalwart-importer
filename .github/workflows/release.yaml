@@ -1,0 +1,30 @@
+name: Release
+on: push
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.24'
+
+      - name: Display Go version
+        run: go version
+
+      - name: Builds
+        run: |
+          mkdir output
+          GOOS=windows GOARCH=amd64 go build -o output/stalwart-import_windows-amd64.exe ./cmd/import/
+          GOOS=windows GOARCH=amd64 go build -o output/stalwart-import_linux-amd64.exe ./cmd/import/
+          GOOS=windows GOARCH=arm64 go build -o output/stalwart-import_linux-arm64.exe ./cmd/import/
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          files: |
+            output/*
