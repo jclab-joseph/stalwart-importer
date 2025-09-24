@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/pkg/errors"
 )
 
 // Format represents the format of the mailbox
@@ -46,10 +48,15 @@ type Entry struct {
 // Mailbox represents a mailbox iterator for a single mailbox
 type Mailbox struct {
 	format     Format
-	files      []string
-	fileIdx    int
+	Path       string         // mailbox path
 	Folder     string         // mailbox folder name
 	keywordMap map[int]string // dovecot keyword ID to name mapping
+}
+
+type ScanResult struct {
+	mailbox *Mailbox
+	files   []string
+	fileIdx int
 }
 
 // scanMailboxDir scans a single mailbox directory for message files
@@ -202,28 +209,35 @@ func newMailbox(format Format, path string) (*Mailbox, error) {
 		return nil, fmt.Errorf("failed to parse dovecot-keywords: %w", err)
 	}
 
-	files, err := scanMailboxDir(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to scan mailbox: %w", err)
-	}
-
 	return &Mailbox{
 		format:     format,
-		files:      files,
-		fileIdx:    0,
+		Path:       path,
 		Folder:     "Inbox",
 		keywordMap: keywordMap,
 	}, nil
 }
 
+// ScanFiles scans the mailbox directory for message files
+func (m *Mailbox) ScanFiles() (*ScanResult, error) {
+	files, err := scanMailboxDir(m.Path)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to scan mailbox")
+	}
+	return &ScanResult{
+		mailbox: m,
+		files:   files,
+		fileIdx: 0,
+	}, nil
+}
+
 // Next returns the next message from the mailbox
-func (m *Mailbox) Next() (*Message, error) {
-	if m.fileIdx >= len(m.files) {
+func (s *ScanResult) Next() (*Message, error) {
+	if s.fileIdx >= len(s.files) {
 		return nil, io.EOF
 	}
 
-	filename := m.files[m.fileIdx]
-	m.fileIdx++
+	filename := s.files[s.fileIdx]
+	s.fileIdx++
 
 	file, err := os.Open(filename)
 	if err != nil {
@@ -236,14 +250,27 @@ func (m *Mailbox) Next() (*Message, error) {
 		return nil, err
 	}
 
+	m, err := NewMaildirMessage(s.mailbox, filepath.Base(filename))
+	if err != nil {
+		return nil, err
+	}
+	m.Contents = contents
+	return m, nil
+}
+
+func NewMaildirMessage(box *Mailbox, filename string) (*Message, error) {
+	m := &Message{
+		Identifier:   filename,
+		MailboxName:  box.Folder,
+		InternalDate: 0, // Would need to parse from file or filename
+	}
+
 	// Parse flags and keywords from filename (maildir format)
-	base := filepath.Base(filename)
-	flags := []Flag{}
 	keywords := []string{}
 
 	// Maildir flags are after the second colon
-	if colonIndex := strings.LastIndex(base, ":"); colonIndex != -1 {
-		flagStr := base[colonIndex+1:]
+	if colonIndex := strings.LastIndex(filename, ":"); colonIndex != -1 {
+		flagStr := filename[colonIndex+1:]
 
 		// Parse dovecot maildir flags
 		// Basic flags: S(Seen), R(Answered), F(Flagged), T(Deleted), D(Draft)
@@ -251,20 +278,20 @@ func (m *Mailbox) Next() (*Message, error) {
 		for _, char := range flagStr {
 			switch char {
 			case 'S':
-				flags = append(flags, Seen)
+				m.Flags = append(m.Flags, Seen)
 			case 'R':
-				flags = append(flags, Answered)
+				m.Flags = append(m.Flags, Answered)
 			case 'F':
-				flags = append(flags, Flagged)
+				m.Flags = append(m.Flags, Flagged)
 			case 'T':
-				flags = append(flags, Deleted)
+				m.Flags = append(m.Flags, Deleted)
 			case 'D':
-				flags = append(flags, Draft)
+				m.Flags = append(m.Flags, Draft)
 			default:
 				// Keywords: a-z = 0-25
 				if char >= 'a' && char <= 'z' {
 					keywordID := int(char - 'a')
-					keyword, ok := m.keywordMap[keywordID]
+					keyword, ok := box.keywordMap[keywordID]
 					if ok {
 						keywords = append(keywords, keyword)
 					} else {
@@ -276,14 +303,7 @@ func (m *Mailbox) Next() (*Message, error) {
 	}
 
 	// Convert dovecot keywords to JMAP keywords
-	jmapKeywords := convertDovecotKeywordsToJMAP(keywords)
+	m.Keywords = convertDovecotKeywordsToJMAP(keywords)
 
-	return &Message{
-		Identifier:   base,
-		MailboxName:  m.Folder,
-		Flags:        flags,
-		Keywords:     jmapKeywords,
-		InternalDate: 0, // Would need to parse from file or filename
-		Contents:     contents,
-	}, nil
+	return m, nil
 }

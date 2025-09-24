@@ -1,25 +1,25 @@
 package main
 
 import (
+	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	jmapclient "github.com/jclab-joseph/stalwart-importer/pkg/jmap"
 	"github.com/jclab-joseph/stalwart-importer/pkg/mailbox"
+	_ "modernc.org/sqlite"
 )
-
-// MailboxMapping represents a single mailbox mapping rule
-type MailboxMapping struct {
-	Source string `json:"source"`
-	Target string `json:"target"`
-}
 
 type StringArray []string
 
@@ -88,6 +88,11 @@ type ImportMessages struct {
 	Path          string         `json:"path"`
 	// MailboxMap Source(old) to Target(server)
 	MailboxMap map[string]string `json:"mailbox_map,omitempty"`
+	StatusDB   string            `json:"status_db,omitempty"`
+	Watch      bool              `json:"watch,omitempty"`
+
+	mu               sync.Mutex
+	watchDebounceMap map[string]*changedItem
 }
 
 // ImportAccount represents the account import command
@@ -154,11 +159,215 @@ func (cmd *ImportMessages) mapMailbox(sourceMailbox string, serverMailboxes map[
 	return ""
 }
 
+// processMessage processes a single message, checking for duplicates and importing if needed
+func (cmd *ImportMessages) processMessage(db *sql.DB, client *JMAPClient, msg *mailbox.Message, totalImported *int64) {
+	mailboxKey := strings.ToLower(msg.MailboxName)
+
+	if db != nil {
+		// Check for duplicate
+		var exists int
+		err := db.QueryRow("SELECT 1 FROM imported_messages WHERE email = ? AND mailbox = ? AND identifier = ?", cmd.Account, mailboxKey, msg.Identifier).Scan(&exists)
+		if err == nil {
+			// Already imported
+			return
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			log.Printf("DB error checking duplicate: %v", err)
+			return
+		}
+	}
+
+	// Convert flags to JMAP keywords
+	keywords := make(map[string]bool)
+	for _, flag := range msg.Flags {
+		switch flag {
+		case mailbox.Seen:
+			keywords["$seen"] = true
+		case mailbox.Answered:
+			keywords["$answered"] = true
+		case mailbox.Flagged:
+			keywords["$flagged"] = true
+		case mailbox.Deleted:
+			keywords["$deleted"] = true
+		case mailbox.Draft:
+			keywords["$draft"] = true
+		}
+	}
+
+	// Merge JMAP keywords from dovecot keywords (already converted in mailbox package)
+	for k, v := range msg.Keywords {
+		keywords[k] = v
+	}
+
+	var receivedAt *int64
+	if msg.InternalDate > 0 {
+		receivedAt = &msg.InternalDate
+	}
+
+	// Retry logic
+	maxRetries := 3
+	for retry := 0; retry < maxRetries; retry++ {
+		err := client.ImportEmail(msg.Contents, msg.MailboxName, keywords, receivedAt)
+		if err == nil {
+			atomic.AddInt64(totalImported, 1)
+			fmt.Printf("Successfully imported message: %s\n", msg.Identifier)
+			if db != nil {
+				// Mark as imported
+				_, err = db.Exec("INSERT INTO imported_messages (email, mailbox, identifier) VALUES (?, ?, ?)", cmd.Account, mailboxKey, msg.Identifier)
+				if err != nil {
+					fmt.Printf("Warning: failed to mark message as imported: %v\n", err)
+				}
+			}
+			return
+		}
+
+		fmt.Printf("Failed to import message %s (attempt %d/%d): %v\n", msg.Identifier, retry+1, maxRetries, err)
+
+		if retry < maxRetries-1 {
+			// Exponential backoff
+			time.Sleep(time.Duration(100*(1<<retry)) * time.Millisecond)
+			continue
+		}
+
+		// Failed after all retries
+		log.Printf("Failed to import message %s after %d attempts: %v", msg.Identifier, maxRetries, err)
+	}
+}
+
+type changedItem struct {
+	time         time.Time
+	file         string
+	box          *mailbox.Mailbox
+	serverFolder string
+}
+
+// watchDirectory watches the directory for new files and processes them
+func (cmd *ImportMessages) watchDirectory(box *mailbox.Mailbox, serverFolder string, db *sql.DB, client *JMAPClient, totalImported *int64, sem chan struct{}) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Printf("Failed to create watcher: %v", err)
+		return
+	}
+	defer watcher.Close()
+
+	// Watch cur and new directories
+	curPath := filepath.Join(box.Path, "cur")
+	newPath := filepath.Join(box.Path, "new")
+	if err := watcher.Add(curPath); err != nil && !os.IsNotExist(err) {
+		log.Printf("Failed to watch %s: %v", curPath, err)
+	}
+	if err := watcher.Add(newPath); err != nil && !os.IsNotExist(err) {
+		log.Printf("Failed to watch %s: %v", newPath, err)
+	}
+
+	for {
+		select {
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+			log.Printf("Watch event: %+v", event)
+			if (event.Op&fsnotify.Create == fsnotify.Create) || (event.Op&fsnotify.Write == fsnotify.Write) {
+				cmd.onWatchEvent(box, serverFolder, event)
+			}
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+			log.Printf("Watcher error: %v", err)
+		}
+	}
+}
+
+func (cmd *ImportMessages) onWatchEvent(box *mailbox.Mailbox, serverFolder string, event fsnotify.Event) {
+	cmd.mu.Lock()
+	defer cmd.mu.Unlock()
+	cmd.watchDebounceMap[event.Name] = &changedItem{
+		time:         time.Now(),
+		file:         event.Name,
+		box:          box,
+		serverFolder: serverFolder,
+	}
+}
+
+func (cmd *ImportMessages) loopWatchMessages(db *sql.DB, client *JMAPClient, totalImported *int64, sem chan struct{}) {
+	for {
+		time.Sleep(time.Second)
+		cmd.flushWatchedMessages(db, client, totalImported, sem)
+	}
+}
+
+func (cmd *ImportMessages) flushWatchedMessages(db *sql.DB, client *JMAPClient, totalImported *int64, sem chan struct{}) {
+	cmd.mu.Lock()
+	defer cmd.mu.Unlock()
+
+	now := time.Now()
+	for filename, item := range cmd.watchDebounceMap {
+		if now.Sub(item.time) >= time.Second*2 {
+			delete(cmd.watchDebounceMap, filename)
+
+			// New file created
+			go func(item *changedItem) {
+				// Wait for semaphore
+				sem <- struct{}{}
+				defer func() {
+					<-sem
+				}()
+				cmd.processNewFile(item.box, db, client, item.file, item.serverFolder, totalImported)
+			}(item)
+		}
+	}
+}
+
+// processNewFile processes a newly created file
+func (cmd *ImportMessages) processNewFile(box *mailbox.Mailbox, db *sql.DB, client *JMAPClient, filePath string, serverFolder string, totalImported *int64) {
+	// Parse message from file
+	contents, err := os.ReadFile(filePath)
+	if err != nil {
+		log.Printf("Failed to read new file %s: %v", filePath, err)
+		return
+	}
+
+	msg, err := mailbox.NewMaildirMessage(box, filepath.Base(filePath))
+	if err != nil {
+		log.Printf("Failed to parse new file %s: %v", filePath, err)
+		return
+	}
+
+	msg.MailboxName = serverFolder
+	msg.Contents = contents
+
+	cmd.processMessage(db, client, msg, totalImported)
+}
+
 // Execute executes the messages import
 func (cmd *ImportMessages) Execute(client *JMAPClient) error {
+	cmd.watchDebounceMap = make(map[string]*changedItem)
+
 	numConcurrent := runtime.NumCPU()
 	if cmd.NumConcurrent != nil {
 		numConcurrent = *cmd.NumConcurrent
+	}
+
+	// Initialize DB if status-db is provided
+	var db *sql.DB
+	if cmd.StatusDB != "" {
+		var err error
+		db, err = sql.Open("sqlite", cmd.StatusDB+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+		if err != nil {
+			return fmt.Errorf("failed to open status DB: %w", err)
+		}
+		defer db.Close()
+
+		// Create table
+		_, err = db.Exec(`CREATE TABLE IF NOT EXISTS imported_messages (
+            email TEXT NOT NULL,
+            mailbox TEXT NOT NULL,
+			identifier TEXT,
+			PRIMARY KEY (email, mailbox, identifier)
+		)`)
+		if err != nil {
+			return fmt.Errorf("failed to create table: %w", err)
+		}
 	}
 
 	fmt.Println("[1/4] Parsing mailbox...")
@@ -166,6 +375,17 @@ func (cmd *ImportMessages) Execute(client *JMAPClient) error {
 	boxes, err := mailbox.NewMailbox(cmd.Format, cmd.Path)
 	if err != nil {
 		return fmt.Errorf("failed to open mailbox: %w", err)
+	}
+
+	fmt.Println("[1.5/4] Scanning mailbox files...")
+
+	scanResults := make(map[string]*mailbox.ScanResult, len(boxes))
+	for _, box := range boxes {
+		if scanResult, err := box.ScanFiles(); err != nil {
+			return fmt.Errorf("failed to scan mailbox files: %w", err)
+		} else {
+			scanResults[box.Folder] = scanResult
+		}
 	}
 
 	fmt.Println("[2/4] Fetching existing mailboxes...")
@@ -177,11 +397,13 @@ func (cmd *ImportMessages) Execute(client *JMAPClient) error {
 	fmt.Println("[3/4] Checking mailboxes...")
 
 	// Check all mailboxes found
+	mailboxMap := make(map[string]string, len(boxes))
 	for _, box := range boxes {
 		target := cmd.mapMailbox(box.Folder, serverMailboxes)
 		if target == "" {
 			log.Fatalf("Mailbox '%s' not found on server\n", box.Folder)
 		}
+		mailboxMap[box.Folder] = target
 	}
 
 	fmt.Println("[4/4] Importing messages...")
@@ -189,13 +411,26 @@ func (cmd *ImportMessages) Execute(client *JMAPClient) error {
 	totalImported := int64(0)
 	failures := []string{}
 
-	var wg sync.WaitGroup
 	sem := make(chan struct{}, numConcurrent)
+
+	if cmd.Watch {
+		go cmd.loopWatchMessages(db, client, &totalImported, sem)
+
+		// Start watching in background
+		for _, box := range boxes {
+			serverFolder := mailboxMap[box.Folder]
+			go cmd.watchDirectory(box, serverFolder, db, client, &totalImported, sem)
+		}
+	}
+
+	var wg sync.WaitGroup
 
 	// Process each mailbox
 	for _, box := range boxes {
+		serverFolder := mailboxMap[box.Folder]
+		scanResult := scanResults[box.Folder]
 		for {
-			msg, err := box.Next()
+			msg, err := scanResult.Next()
 			if err == io.EOF {
 				break
 			}
@@ -204,65 +439,14 @@ func (cmd *ImportMessages) Execute(client *JMAPClient) error {
 				continue
 			}
 
+			msg.MailboxName = serverFolder
+
 			wg.Add(1)
 			go func(msg *mailbox.Message) {
 				defer wg.Done()
 				sem <- struct{}{}
-				defer func() { <-sem }()
-
-				// Convert flags to JMAP keywords
-				keywords := make(map[string]bool)
-				for _, flag := range msg.Flags {
-					switch flag {
-					case "seen":
-						keywords["$seen"] = true
-					case "answered":
-						keywords["$answered"] = true
-					case "flagged":
-						keywords["$flagged"] = true
-					case "deleted":
-						keywords["$deleted"] = true
-					case "draft":
-						keywords["$draft"] = true
-					}
-				}
-
-				// Merge JMAP keywords from dovecot keywords (already converted in mailbox package)
-				for k, v := range msg.Keywords {
-					keywords[k] = v
-				}
-
-				// Use mailbox name from the message (for nested maildir support)
-				sourceMailboxName := msg.MailboxName
-				// Map to server mailbox name
-				mailboxName := cmd.mapMailbox(sourceMailboxName, serverMailboxes)
-
-				var receivedAt *int64
-				if msg.InternalDate > 0 {
-					receivedAt = &msg.InternalDate
-				}
-
-				// Retry logic
-				maxRetries := 3
-				for retry := 0; retry < maxRetries; retry++ {
-					err := client.ImportEmail(msg.Contents, mailboxName, keywords, receivedAt)
-					if err == nil {
-						atomic.AddInt64(&totalImported, 1)
-						fmt.Printf("Successfully imported message: %s\n", msg.Identifier)
-						return
-					}
-
-					fmt.Printf("Failed to import message %s (attempt %d/%d): %v\n", msg.Identifier, retry+1, maxRetries, err)
-
-					if retry < maxRetries-1 {
-						// Exponential backoff
-						time.Sleep(time.Duration(100*(1<<retry)) * time.Millisecond)
-						continue
-					}
-
-					// Failed after all retries
-					failures = append(failures, fmt.Sprintf("Failed to import message %s after %d attempts: %v", msg.Identifier, maxRetries, err))
-				}
+				cmd.processMessage(db, client, msg, &totalImported)
+				<-sem
 			}(msg)
 		}
 	}
@@ -276,6 +460,12 @@ func (cmd *ImportMessages) Execute(client *JMAPClient) error {
 		for _, failure := range failures {
 			fmt.Println(failure)
 		}
+	}
+
+	if cmd.Watch {
+		fmt.Println("Watching for new files... Press Ctrl+C to stop.")
+		// Keep running
+		select {}
 	}
 
 	return nil
@@ -292,6 +482,8 @@ func main() {
 		timeout       = flag.Int("t", 30, "Connection timeout in seconds")
 		timeoutLong   = flag.Int("timeout", 30, "Connection timeout in seconds")
 		numConcurrent = flag.Int("concurrent", 4, "Number of concurrent requests")
+		statusDB      = flag.String("status-db", "", "Path to status database file for duplicate prevention")
+		watch         = flag.Bool("watch", false, "Watch directory for new files after initial import")
 	)
 	flag.Var(&mailboxMapStrs, "mailbox-map", "Mailbox mapping in format OLD=NEW")
 
@@ -353,6 +545,8 @@ func main() {
 			Account:       account,
 			Path:          path,
 			MailboxMap:    mailboxMap,
+			StatusDB:      *statusDB,
+			Watch:         *watch,
 		}
 	default:
 		log.Fatalf("Unknown command: %s", command)

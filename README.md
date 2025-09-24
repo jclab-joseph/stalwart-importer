@@ -41,6 +41,15 @@ Download from the [releases page](https://github.com/jclab-joseph/stalwart-impor
                   messages maildir-nested user@example.com /path/to/maildir
 ```
 
+### With Duplicate Prevention and Live Watching
+```bash
+./stalwart-import -u https://mail.example.com/jmap/session \
+                  -c 'admin:password' \
+                  --status-db status.db \
+                  --watch \
+                  messages maildir-nested user@example.com /path/to/maildir
+```
+
 ## Command Line Options
 
 ### Global Options
@@ -50,6 +59,8 @@ Download from the [releases page](https://github.com/jclab-joseph/stalwart-impor
 
 ### Import Options
 - `--mailbox-map <OLD=NEW>`: Map source mailbox name to destination mailbox name (can be used multiple times)
+- `--status-db <path>`: Path to SQLite database file for tracking imported messages to prevent duplicates
+- `--watch`: Watch directory for new files after initial import and import them automatically
 
 ### Import Command
 ```
