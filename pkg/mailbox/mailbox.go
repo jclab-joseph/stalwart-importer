@@ -92,7 +92,8 @@ func normalizeMailboxName(dirName string) string {
 	if !strings.HasPrefix(dirName, ".") {
 		return "Inbox" // Root directory
 	}
-	return dirName[1:]
+	folder, _ := DecodeIMAPUTF7(dirName[1:])
+	return folder
 }
 
 // parseDovecotKeywords parses a dovecot-keywords file and returns keyword ID to name mapping

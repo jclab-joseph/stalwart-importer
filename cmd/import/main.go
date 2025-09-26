@@ -87,9 +87,10 @@ type ImportMessages struct {
 	Account       string         `json:"account"`
 	Path          string         `json:"path"`
 	// MailboxMap Source(old) to Target(server)
-	MailboxMap map[string]string `json:"mailbox_map,omitempty"`
-	StatusDB   string            `json:"status_db,omitempty"`
-	Watch      bool              `json:"watch,omitempty"`
+	MailboxMap         map[string]string `json:"mailbox_map,omitempty"`
+	StatusDB           string            `json:"status_db,omitempty"`
+	Watch              bool              `json:"watch,omitempty"`
+	AllowCreateMailbox bool              `json:"allow_create_mailbox,omitempty"`
 
 	mu               sync.Mutex
 	watchDebounceMap map[string]*changedItem
@@ -399,9 +400,23 @@ func (cmd *ImportMessages) Execute(client *JMAPClient) error {
 	// Check all mailboxes found
 	mailboxMap := make(map[string]string, len(boxes))
 	for _, box := range boxes {
+		box.Folder, _ = mailbox.DecodeIMAPUTF7(box.Folder)
 		target := cmd.mapMailbox(box.Folder, serverMailboxes)
 		if target == "" {
-			log.Fatalf("Mailbox '%s' not found on server\n", box.Folder)
+			if cmd.AllowCreateMailbox {
+				// Create the mailbox
+				mailboxID, err := client.client.CreateMailbox(box.Folder, nil) // parentID nil for top-level
+				if err != nil {
+					log.Fatalf("Failed to create mailbox '%s': %v\n", box.Folder, err)
+				}
+				target = mailboxID
+				// Update serverMailboxes
+				serverMailboxes[box.Folder] = mailboxID
+
+				log.Fatalf("Mailbox '%s' created\n", box.Folder)
+			} else {
+				log.Fatalf("Mailbox '%s' not found on server\n", box.Folder)
+			}
 		}
 		mailboxMap[box.Folder] = target
 	}
@@ -475,15 +490,17 @@ func main() {
 	// Global flags
 	var mailboxMapStrs StringArray
 	var (
-		url           = flag.String("u", "", "Server base URL")
-		urlLong       = flag.String("url", "", "Server base URL")
-		credentials   = flag.String("c", "", "Authentication credentials (user:password)")
-		credLong      = flag.String("credentials", "", "Authentication credentials (user:password)")
-		timeout       = flag.Int("t", 30, "Connection timeout in seconds")
-		timeoutLong   = flag.Int("timeout", 30, "Connection timeout in seconds")
-		numConcurrent = flag.Int("concurrent", 4, "Number of concurrent requests")
-		statusDB      = flag.String("status-db", "", "Path to status database file for duplicate prevention")
-		watch         = flag.Bool("watch", false, "Watch directory for new files after initial import")
+		url                = flag.String("u", "", "Server base URL")
+		urlLong            = flag.String("url", "", "Server base URL")
+		credentials        = flag.String("c", "", "Authentication credentials (user:password)")
+		credLong           = flag.String("credentials", "", "Authentication credentials (user:password)")
+		timeout            = flag.Int("t", 30, "Connection timeout in seconds")
+		timeoutLong        = flag.Int("timeout", 30, "Connection timeout in seconds")
+		numConcurrent      = flag.Int("concurrent", 4, "Number of concurrent requests")
+		statusDB           = flag.String("status-db", "", "Path to status database file for duplicate prevention")
+		watch              = flag.Bool("watch", false, "Watch directory for new files after initial import")
+		allowCreateMailbox = flag.Bool("allow-create-mailbox", false, "Allow creating mailboxes if they do not exist on the server")
+		presetMailboxMap   = flag.Bool("preset-mailbox-map", false, "Use preset mailbox map")
 	)
 	flag.Var(&mailboxMapStrs, "mailbox-map", "Mailbox mapping in format OLD=NEW")
 
@@ -530,6 +547,16 @@ func main() {
 		path := args[2]
 		// Parse mailbox mapping
 		mailboxMap := make(map[string]string, len(mailboxMapStrs))
+
+		if *presetMailboxMap {
+			mailboxMap["Sent Messages"] = "Sent Items"
+
+			mailboxMap["보낸 편지함"] = "Sent Items"
+			mailboxMap["정크 메일"] = "Junk Mail"
+			mailboxMap["지운 편지"] = "Deleted Items"
+			mailboxMap["임시 보관함"] = "Deleted Items"
+		}
+
 		for _, str := range mailboxMapStrs {
 			parts := strings.Split(str, "=")
 			if len(parts) == 2 {
@@ -540,13 +567,14 @@ func main() {
 		}
 
 		cmd.Messages = &ImportMessages{
-			NumConcurrent: numConcurrent,
-			Format:        format,
-			Account:       account,
-			Path:          path,
-			MailboxMap:    mailboxMap,
-			StatusDB:      *statusDB,
-			Watch:         *watch,
+			NumConcurrent:      numConcurrent,
+			Format:             format,
+			Account:            account,
+			Path:               path,
+			MailboxMap:         mailboxMap,
+			StatusDB:           *statusDB,
+			Watch:              *watch,
+			AllowCreateMailbox: *allowCreateMailbox,
 		}
 	default:
 		log.Fatalf("Unknown command: %s", command)

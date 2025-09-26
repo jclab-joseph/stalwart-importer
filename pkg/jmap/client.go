@@ -12,6 +12,7 @@ import (
 
 	"github.com/foxcpp/go-jmap"
 	"github.com/foxcpp/go-jmap/client"
+	mailbox2 "github.com/jclab-joseph/stalwart-importer/pkg/mailbox"
 )
 
 // PrincipalQueryRequest represents a Principal/query request
@@ -131,8 +132,8 @@ func (t *headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Replace "Authentication" header with "Authorization"
 	if auth := req.Header.Get("Authentication"); auth != "" {
 		req.Header.Del("Authentication")
-		req.Header.Set("Authorization", t.authHeader)
 	}
+	req.Header.Set("Authorization", t.authHeader)
 	return t.baseTransport.RoundTrip(req)
 }
 
@@ -224,7 +225,6 @@ func (c *Client) GetAccountID(email string) error {
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(c.username+":"+c.password)))
 
 	resp, err := c.client.HTTPClient.Do(req)
 	if err != nil {
@@ -297,7 +297,6 @@ func (c *Client) GetMailboxes() error {
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(c.username+":"+c.password)))
 
 	resp, err := c.client.HTTPClient.Do(req)
 	if err != nil {
@@ -323,6 +322,7 @@ func (c *Client) GetMailboxes() error {
 						if mailbox, ok := item.(map[string]interface{}); ok {
 							if name, ok := mailbox["name"].(string); ok {
 								if id, ok := mailbox["id"].(string); ok {
+									name, _ = mailbox2.DecodeIMAPUTF7(name)
 									c.mailboxIDs[name] = id
 								}
 							}
@@ -339,6 +339,86 @@ func (c *Client) GetMailboxes() error {
 	}
 
 	return nil
+}
+
+// CreateMailbox creates a mailbox via JMAP Mailbox/set
+func (c *Client) CreateMailbox(name string, parentID *string) (string, error) {
+	if c.accountID == "" {
+		return "", fmt.Errorf("account ID not set")
+	}
+
+	// Build request payload
+	createArgs := map[string]interface{}{
+		"accountId": string(c.accountID),
+		"create": map[string]interface{}{
+			"c0": map[string]interface{}{
+				"name": name,
+			},
+		},
+	}
+	if parentID != nil && *parentID != "" {
+		createArgs["create"].(map[string]interface{})["c0"].(map[string]interface{})["parentId"] = *parentID
+	}
+
+	session, err := c.client.UpdateSession()
+	if err != nil {
+		return "", fmt.Errorf("failed to get session: %w", err)
+	}
+
+	payload := map[string]interface{}{
+		"using": []string{"urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"},
+		"methodCalls": []interface{}{
+			[]interface{}{
+				"Mailbox/set",
+				createArgs,
+				"m0",
+			},
+		},
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal mailbox create request: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", session.APIURL, bytes.NewReader(data))
+	if err != nil {
+		return "", fmt.Errorf("failed to create mailbox create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.client.HTTPClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("mailbox create request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("mailbox create failed with status: %d", resp.StatusCode)
+	}
+
+	var response map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		return "", fmt.Errorf("failed to decode mailbox create response: %w", err)
+	}
+
+	if methodResponses, ok := response["methodResponses"].([]interface{}); ok && len(methodResponses) > 0 {
+		if respArray, ok := methodResponses[0].([]interface{}); ok && len(respArray) >= 3 {
+			if result, ok := respArray[1].(map[string]interface{}); ok {
+				if created, ok := result["created"].(map[string]interface{}); ok {
+					if c0, ok := created["c0"].(map[string]interface{}); ok {
+						if id, ok := c0["id"].(string); ok {
+							// Update local mailbox map as well
+							c.mailboxIDs[name] = id
+							return id, nil
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return "", fmt.Errorf("failed to parse mailbox create response")
 }
 
 // UploadBlob uploads a blob using the library's Upload method
@@ -429,7 +509,6 @@ func (c *Client) ImportEmail(contents []byte, mailboxName string, keywords map[s
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(c.username+":"+c.password)))
 
 	resp, err := c.client.HTTPClient.Do(req)
 	if err != nil {
